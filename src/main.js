@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import RAPIER from "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.17.3/+esm";
 import {
   FilesetResolver,
   FaceLandmarker,
@@ -18,6 +19,7 @@ const statusDot = document.querySelector(".status-dot");
 const buttons = [...document.querySelectorAll(".gesture-button")];
 
 const MODEL_URL = "./assets/models/escaparate.glb?v=2";
+const STATIC_SCENE_NAMES = new Set(["cube", "cube001"]);
 const HEAD_CAMERA_SCALE = {
   x: 0.42,
   y: 0.26,
@@ -31,8 +33,11 @@ const HEAD_TURN_ROTATION = {
   pitch: 0.2,
 };
 const SHOWCASE_DIRECTION = -1;
+const STATIC_SURFACE_HALF_THICKNESS = 0.04;
 
 const state = {
+  rapier: null,
+  physicsWorld: null,
   renderer: null,
   scene: null,
   camera: null,
@@ -44,15 +49,25 @@ const state = {
   handLandmarker: null,
   raycaster: new THREE.Raycaster(),
   pointerNdc: new THREE.Vector2(),
+  pointerRayDirection: new THREE.Vector3(),
+  grabPlane: new THREE.Plane(),
+  grabOffset: new THREE.Vector3(),
+  hoverHitPoint: new THREE.Vector3(),
   hoverBox: null,
   hoveredMesh: null,
   interactiveMeshes: [],
+  meshBodies: new Map(),
   modelRoot: null,
+  grabTargetPosition: new THREE.Vector3(),
+  grabVelocity: new THREE.Vector3(),
+  lastGrabTime: 0,
   lastVideoTime: -1,
   parallaxX: 0,
   parallaxY: 0,
   headTurnX: 0,
   headTurnY: 0,
+  grabbedMesh: null,
+  grabbedBody: null,
   pinchActive: false,
 };
 
@@ -73,6 +88,139 @@ function showToast(message) {
 }
 
 const lerp = (from, to, amount) => from + (to - from) * amount;
+
+function isStaticSceneMesh(mesh) {
+  const normalizeName = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const meshNames = [mesh.name, mesh.parent?.name].filter(Boolean).map(normalizeName);
+  return meshNames.some((name) => STATIC_SCENE_NAMES.has(name));
+}
+
+function toRapierVector(vector) {
+  return { x: vector.x, y: vector.y, z: vector.z };
+}
+
+function toRapierQuaternion(quaternion) {
+  return { x: quaternion.x, y: quaternion.y, z: quaternion.z, w: quaternion.w };
+}
+
+async function setupPhysics() {
+  await RAPIER.init();
+  state.rapier = RAPIER;
+  state.physicsWorld = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+}
+
+function createRigidBodyForMesh(mesh) {
+  if (!state.physicsWorld || !mesh.geometry) return;
+
+  mesh.geometry.computeBoundingBox();
+  if (!mesh.geometry.boundingBox) return;
+
+  const worldPosition = new THREE.Vector3();
+  const worldQuaternion = new THREE.Quaternion();
+  const worldScale = new THREE.Vector3();
+  mesh.getWorldPosition(worldPosition);
+  mesh.getWorldQuaternion(worldQuaternion);
+  mesh.getWorldScale(worldScale);
+
+  const localBox = mesh.geometry.boundingBox.clone();
+  const localSize = localBox.getSize(new THREE.Vector3());
+  const localCenter = localBox.getCenter(new THREE.Vector3());
+  const halfExtents = new THREE.Vector3(
+    Math.max((localSize.x * worldScale.x) / 2, 0.05),
+    Math.max((localSize.y * worldScale.y) / 2, 0.05),
+    Math.max((localSize.z * worldScale.z) / 2, 0.05),
+  );
+
+  const bodyDesc = isStaticSceneMesh(mesh)
+    ? state.rapier.RigidBodyDesc.fixed()
+    : state.rapier.RigidBodyDesc.dynamic();
+
+  bodyDesc.setTranslation(worldPosition.x, worldPosition.y, worldPosition.z);
+  bodyDesc.setRotation(toRapierQuaternion(worldQuaternion));
+
+  if (!isStaticSceneMesh(mesh)) {
+    bodyDesc.setLinearDamping(2.8);
+    bodyDesc.setAngularDamping(4.2);
+  }
+
+  const body = state.physicsWorld.createRigidBody(bodyDesc);
+  if (isStaticSceneMesh(mesh)) {
+    const baseX = localCenter.x * worldScale.x;
+    const baseY = localCenter.y * worldScale.y;
+    const baseZ = localCenter.z * worldScale.z;
+    const colliders = [
+      {
+        desc: state.rapier.ColliderDesc.cuboid(
+          halfExtents.x,
+          STATIC_SURFACE_HALF_THICKNESS,
+          halfExtents.z,
+        ),
+        translation: {
+          x: baseX,
+          y: baseY - halfExtents.y + STATIC_SURFACE_HALF_THICKNESS,
+          z: baseZ,
+        },
+      },
+      {
+        desc: state.rapier.ColliderDesc.cuboid(
+          STATIC_SURFACE_HALF_THICKNESS,
+          halfExtents.y,
+          halfExtents.z,
+        ),
+        translation: {
+          x: baseX - halfExtents.x + STATIC_SURFACE_HALF_THICKNESS,
+          y: baseY,
+          z: baseZ,
+        },
+      },
+      {
+        desc: state.rapier.ColliderDesc.cuboid(
+          STATIC_SURFACE_HALF_THICKNESS,
+          halfExtents.y,
+          halfExtents.z,
+        ),
+        translation: {
+          x: baseX + halfExtents.x - STATIC_SURFACE_HALF_THICKNESS,
+          y: baseY,
+          z: baseZ,
+        },
+      },
+    ];
+
+    colliders.forEach(({ desc, translation }) => {
+      desc.setTranslation(translation.x, translation.y, translation.z);
+      desc.setFriction(1.1);
+      desc.setRestitution(0.05);
+      state.physicsWorld.createCollider(desc, body);
+    });
+  } else {
+    const colliderDesc = state.rapier.ColliderDesc.cuboid(
+      halfExtents.x,
+      halfExtents.y,
+      halfExtents.z,
+    );
+    colliderDesc.setTranslation(
+      localCenter.x * worldScale.x,
+      localCenter.y * worldScale.y,
+      localCenter.z * worldScale.z,
+    );
+    colliderDesc.setFriction(1.1);
+    colliderDesc.setRestitution(0.05);
+    state.physicsWorld.createCollider(colliderDesc, body);
+  }
+
+  mesh.userData.physicsBody = body;
+  state.meshBodies.set(mesh, body);
+}
+
+function syncMeshesFromPhysics() {
+  state.meshBodies.forEach((body, mesh) => {
+    const translation = body.translation();
+    const rotation = body.rotation();
+    mesh.position.set(translation.x, translation.y, translation.z);
+    mesh.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
+  });
+}
 
 async function setupThreeScene() {
   const renderer = new THREE.WebGLRenderer({
@@ -114,7 +262,9 @@ async function setupThreeScene() {
           emissiveIntensity: material.emissiveIntensity ?? 0,
         });
       });
-      state.interactiveMeshes.push(child);
+      if (!isStaticSceneMesh(child)) {
+        state.interactiveMeshes.push(child);
+      }
     }
   });
 
@@ -152,6 +302,13 @@ async function setupThreeScene() {
   state.cameraBaseOffset.copy(state.cameraBasePosition).sub(state.cameraTarget);
   state.hoverBox = hoverBox;
   state.modelRoot = modelRoot;
+
+  modelRoot.traverse((child) => {
+    if (child.isMesh) {
+      createRigidBodyForMesh(child);
+    }
+  });
+  syncMeshesFromPhysics();
 }
 
 async function setupCamera() {
@@ -212,7 +369,7 @@ function drawHandPreview(hand) {
   trackingCtx.fillStyle = "rgba(58, 214, 189, 0.92)";
   for (const point of hand) {
     trackingCtx.beginPath();
-    trackingCtx.arc((1 - point.x) * rect.width, point.y * rect.height, 3, 0, Math.PI * 2);
+    trackingCtx.arc(point.x * rect.width, point.y * rect.height, 3, 0, Math.PI * 2);
     trackingCtx.fill();
   }
 }
@@ -280,6 +437,14 @@ function setHoveredMesh(mesh) {
   }
 }
 
+function getPointerRay(screenX, screenY) {
+  const rect = stage.getBoundingClientRect();
+  state.pointerNdc.x = ((screenX - rect.left) / rect.width) * 2 - 1;
+  state.pointerNdc.y = -(((screenY - rect.top) / rect.height) * 2 - 1);
+  state.raycaster.setFromCamera(state.pointerNdc, state.camera);
+  return state.raycaster.ray;
+}
+
 function applyBlenderCameraTransform(width, height) {
   if (!state.camera) return;
 
@@ -333,16 +498,78 @@ function updateSceneHover(screenX, screenY, htmlTarget) {
   const height = Math.max(1, Math.floor(rect.height));
   applyBlenderCameraTransform(width, height);
 
-  state.pointerNdc.x = ((screenX - rect.left) / rect.width) * 2 - 1;
-  state.pointerNdc.y = -(((screenY - rect.top) / rect.height) * 2 - 1);
-  state.raycaster.setFromCamera(state.pointerNdc, state.camera);
-
+  const ray = getPointerRay(screenX, screenY);
   const [hit] = state.raycaster.intersectObjects(state.interactiveMeshes, false);
   setHoveredMesh(hit?.object ?? null);
+  if (hit) {
+    state.hoverHitPoint.copy(hit.point);
+  } else {
+    state.hoverHitPoint.set(0, 0, 0);
+  }
+  return ray;
+}
+
+function startGrab(screenX, screenY) {
+  if (!state.hoveredMesh) return;
+
+  const body = state.meshBodies.get(state.hoveredMesh);
+  if (!body || body.isFixed()) return;
+
+  const objectPosition = new THREE.Vector3();
+  state.hoveredMesh.getWorldPosition(objectPosition);
+  state.camera.getWorldDirection(state.pointerRayDirection);
+  state.grabPlane.setFromNormalAndCoplanarPoint(state.pointerRayDirection, objectPosition);
+
+  const ray = getPointerRay(screenX, screenY);
+  const hitOnPlane = new THREE.Vector3();
+  if (!ray.intersectPlane(state.grabPlane, hitOnPlane)) return;
+
+  state.grabOffset.copy(objectPosition).sub(hitOnPlane);
+  state.grabTargetPosition.copy(objectPosition);
+  state.grabVelocity.set(0, 0, 0);
+  state.lastGrabTime = performance.now();
+  state.grabbedMesh = state.hoveredMesh;
+  state.grabbedBody = body;
+  body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+  body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  body.setBodyType(state.rapier.RigidBodyType.KinematicPositionBased, true);
+}
+
+function updateGrab(screenX, screenY) {
+  if (!state.grabbedBody || !state.grabbedMesh) return;
+
+  const ray = getPointerRay(screenX, screenY);
+  const hitOnPlane = new THREE.Vector3();
+  if (!ray.intersectPlane(state.grabPlane, hitOnPlane)) return;
+
+  const targetPosition = hitOnPlane.add(state.grabOffset);
+  const now = performance.now();
+  const deltaSeconds = Math.max((now - state.lastGrabTime) / 1000, 1 / 240);
+  state.grabVelocity
+    .copy(targetPosition)
+    .sub(state.grabTargetPosition)
+    .divideScalar(deltaSeconds);
+  state.grabTargetPosition.copy(targetPosition);
+  state.lastGrabTime = now;
+
+  state.grabbedBody.setNextKinematicTranslation(toRapierVector(targetPosition));
+  state.grabbedBody.setNextKinematicRotation(toRapierQuaternion(state.grabbedMesh.quaternion));
+}
+
+function releaseGrab() {
+  if (!state.grabbedBody) return;
+
+  state.grabbedBody.setBodyType(state.rapier.RigidBodyType.Dynamic, true);
+  state.grabbedBody.setLinvel(toRapierVector(state.grabVelocity), true);
+  state.grabbedBody.wakeUp();
+  state.grabVelocity.set(0, 0, 0);
+  state.grabbedMesh = null;
+  state.grabbedBody = null;
 }
 
 function updateHandInteraction(hand) {
   if (!hand) {
+    releaseGrab();
     cursor.classList.remove("is-visible", "is-pinching");
     buttons.forEach((button) => button.classList.remove("is-targeted", "is-pressed"));
     setHoveredMesh(null);
@@ -352,8 +579,10 @@ function updateHandInteraction(hand) {
 
   const indexTip = hand[8];
   const thumbTip = hand[4];
-  const screenX = (1 - indexTip.x) * window.innerWidth;
-  const screenY = indexTip.y * window.innerHeight;
+  const pointerX = (indexTip.x + thumbTip.x) / 2;
+  const pointerY = (indexTip.y + thumbTip.y) / 2;
+  const screenX = (1 - pointerX) * window.innerWidth;
+  const screenY = pointerY * window.innerHeight;
   const pinchDistance = Math.hypot(indexTip.x - thumbTip.x, indexTip.y - thumbTip.y);
   const isPinching = pinchDistance < 0.055;
 
@@ -371,22 +600,31 @@ function updateHandInteraction(hand) {
     item.classList.toggle("is-pressed", item === button && isPinching);
   });
 
-  if (button && isPinching && !state.pinchActive) {
+  if (state.grabbedBody && isPinching) {
+    updateGrab(screenX, screenY);
+  } else if (button && isPinching && !state.pinchActive) {
     button.click();
   } else if (state.hoveredMesh && isPinching && !state.pinchActive) {
-    showToast(`Objeto 3D: ${state.hoveredMesh.name || "malla seleccionada"}`);
+    startGrab(screenX, screenY);
+  }
+
+  if (!isPinching && state.pinchActive) {
+    releaseGrab();
   }
 
   state.pinchActive = isPinching;
 }
 
 function renderScene() {
-  if (!state.renderer || !state.scene || !state.camera) return;
+  if (!state.renderer || !state.scene || !state.camera || !state.physicsWorld) return;
 
   const rect = stage.getBoundingClientRect();
   const width = Math.max(1, Math.floor(rect.width));
   const height = Math.max(1, Math.floor(rect.height));
   state.renderer.setSize(width, height, false);
+
+  state.physicsWorld.step();
+  syncMeshesFromPhysics();
 
   applyBlenderCameraTransform(width, height);
 
@@ -445,6 +683,8 @@ buttons.forEach((button) => {
 
 async function init() {
   try {
+    setStatus("Cargando fisicas");
+    await setupPhysics();
     setStatus("Cargando escena");
     await setupThreeScene();
     renderScene();
