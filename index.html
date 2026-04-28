@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Escaparate Parallax</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="showcase">
+      <video class="camera-feed" playsinline muted></video>
+      <canvas class="tracking-canvas"></canvas>
+
+      <section class="stage" aria-label="Escaparate interactivo">
+        <canvas class="three-scene" aria-label="Escena 3D importada de Blender"></canvas>
+
+        <div class="ambient ambient-a"></div>
+        <div class="ambient ambient-b"></div>
+
+        <div class="depth-layer layer-back"></div>
+        <div class="depth-layer layer-mid"></div>
+
+        <nav class="actions" aria-label="Acciones">
+          <button class="gesture-button" type="button" data-action="details">
+            Ver detalle
+          </button>
+          <button class="gesture-button" type="button" data-action="next">
+            Siguiente
+          </button>
+        </nav>
+      </section>
+
+      <aside class="hud" aria-live="polite">
+        <span class="status-dot"></span>
+        <span class="status-text">Iniciando camara</span>
+      </aside>
+
+      <div class="toast" role="status" aria-live="polite"></div>
+      <div class="gesture-cursor" aria-hidden="true"></div>
+    </main>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
